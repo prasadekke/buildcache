@@ -7,25 +7,23 @@
 // GOCACHEPROG); this binary itself builds with any reasonably modern Go
 // toolchain, since it only depends on the standard library.
 //
-// Two modes, tried in order:
-//
-//  1. Server mode: if a cacheserver daemon is listening on the default (or
-//     -socket) Unix socket, cacheprog dials it and simply pipes its own
-//     stdin/stdout to that connection. cacheserver speaks the exact same
-//     wire protocol, so no re-framing happens here -- it's a byte-for-byte
-//     relay in each direction, giving a warm, shared store across many
-//     invocations instead of one disk.Store per subprocess.
-//  2. Direct mode: if no daemon is reachable (or -no-server is set),
-//     cacheprog opens its own local disk.Store and serves the protocol
-//     itself. This keeps cacheprog usable with zero setup even if nobody
-//     ever starts cacheserver -- "almost zero config" shouldn't regress to
-//     "now you must also run a daemon."
+// cacheprog always opens its own local disk.Store (see internal/cas/disk)
+// and serves the GOCACHEPROG protocol against it directly -- that alone is
+// enough for cacheprog to work with zero setup even if nobody ever starts
+// cacheserver. If a cacheserver daemon is also reachable on the default
+// (or -socket) Unix socket, its store is layered in as a second tier (see
+// internal/cas/tiered): local disk is checked first, and only a local miss
+// reaches the daemon, with the result written through to local disk so the
+// next Get for the same action is served purely locally. This replaces the
+// older "either talk to the daemon, or go fully local" byte-relay proxy
+// mode -- talking to *both* every time gets GOCACHE-class speed for
+// repeat local hits without giving up the shared cache's benefit for
+// actions this machine has never built.
 package main
 
 import (
 	"flag"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -33,18 +31,20 @@ import (
 
 	"github.com/prasadekke/buildcache/internal/cas"
 	"github.com/prasadekke/buildcache/internal/cas/disk"
+	"github.com/prasadekke/buildcache/internal/cas/remote"
+	"github.com/prasadekke/buildcache/internal/cas/tiered"
 	"github.com/prasadekke/buildcache/internal/metrics"
 	"github.com/prasadekke/buildcache/internal/protocol"
 	"github.com/prasadekke/buildcache/internal/sockpath"
 )
 
 func main() {
-	dir := flag.String("dir", defaultDir(), "cache directory for direct mode (ignored if a cacheserver is reached)")
-	socket := flag.String("socket", sockpath.Default(), "cacheserver unix socket to try before falling back to direct disk mode")
-	noServer := flag.Bool("no-server", false, "always run in direct disk mode; skip trying the cacheserver socket")
-	gc := flag.Bool("gc", false, "run one eviction sweep against -dir and exit, instead of serving GOCACHEPROG requests -- for direct-mode users without a cacheserver to wire into cron themselves")
+	dir := flag.String("dir", defaultDir(), "local cache directory, always used as at least the local tier")
+	socket := flag.String("socket", sockpath.Default(), "cacheserver unix socket to layer in as a second tier; ignored if -no-server is set or nothing is listening")
+	noServer := flag.Bool("no-server", false, "never try the cacheserver socket; local disk tier only")
+	gc := flag.Bool("gc", false, "run one eviction sweep against -dir and exit, instead of serving GOCACHEPROG requests -- for users without a cacheserver to wire into cron themselves")
 	maxBytes := flag.Int64("max-size", 5<<30, "used only with -gc: evict least-recently-used entries until the store is at or below this many bytes")
-	stats := flag.Bool("stats", false, "print a one-line hit-rate summary to stderr when this build finishes; direct mode only, no effect when a cacheserver is reached (see cacheserver's -metrics-addr instead)")
+	stats := flag.Bool("stats", false, "print a one-line hit-rate summary to stderr when this build finishes (see cacheserver's -metrics-addr for the daemon-side equivalent)")
 	flag.Parse()
 
 	if *gc {
@@ -52,22 +52,33 @@ func main() {
 		return
 	}
 
-	if !*noServer {
-		conn, err := net.DialTimeout("unix", *socket, 200*time.Millisecond)
-		if err == nil {
-			if err := runProxy(conn); err != nil {
-				fail(err)
-			}
-			return
-		}
-		// No daemon listening (or a stale socket file): fall through to
-		// direct mode below. Not an error -- this is the expected path
-		// for anyone who hasn't started cacheserver.
-	}
-
-	store, err := disk.New(*dir)
+	localStore, err := disk.New(*dir)
 	if err != nil {
 		fail(err)
+	}
+
+	var store cas.Store = localStore
+	if !*noServer {
+		if conn, dialErr := net.DialTimeout("unix", *socket, 200*time.Millisecond); dialErr == nil {
+			if remoteStore, err := remote.New(conn); err != nil {
+				// Handshake failed (e.g. something odd is listening on that
+				// path that isn't a cacheserver): degrade to local-only
+				// rather than failing the whole build over it.
+				conn.Close()
+				fmt.Fprintf(os.Stderr, "cacheprog: cacheserver handshake failed, continuing with local disk only: %v\n", err)
+			} else {
+				store = &tiered.Store{
+					Local:  localStore,
+					Remote: remoteStore,
+					Logf: func(format string, args ...any) {
+						fmt.Fprintf(os.Stderr, "cacheprog: "+format+"\n", args...)
+					},
+				}
+			}
+		}
+		// No daemon listening (or a stale socket file): fall through to
+		// local-only below. Not an error -- this is the expected path for
+		// anyone who hasn't started cacheserver.
 	}
 	defer store.Close()
 
@@ -91,26 +102,6 @@ func main() {
 func printStats(s metrics.Snapshot) {
 	fmt.Fprintf(os.Stderr, "cacheprog: %d gets (%d hits, %.1f%% hit rate), %d puts, %d bytes stored\n",
 		s.Gets, s.Hits, s.HitRate()*100, s.Puts, s.PutBytes)
-}
-
-// runProxy relays bytes between the go command (stdin/stdout of this
-// process) and an already-dialed cacheserver connection.
-//
-// It does not wait for the stdin->conn direction to finish before
-// returning: per the GOCACHEPROG protocol, this program should exit as
-// soon as it has replied to a "close" request, and conn->stdout returning
-// is exactly that signal (cacheserver closes the connection right after
-// replying to "close" -- see cmd/cacheserver's serveConn). Waiting on both
-// directions instead risks a deadlock if the go command doesn't close its
-// write end of stdin until *after* this process has already exited, which
-// is the documented behavior, not an edge case. Worth a second look if a
-// Windows/named-pipe transport is ever added, since pipe-closing semantics
-// differ from Unix sockets.
-func runProxy(conn net.Conn) error {
-	defer conn.Close()
-	go io.Copy(conn, os.Stdin)
-	_, err := io.Copy(os.Stdout, conn)
-	return err
 }
 
 func runGC(dir string, maxBytes int64) {

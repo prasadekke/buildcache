@@ -37,9 +37,14 @@ frontend instead, since Cargo has no equivalent extension point.
       has to implement four methods, not the whole protocol.
 - [x] **Server mode** — `cacheserver` is a long-lived daemon holding one
       warm store, shared across many `cacheprog` invocations over a Unix
-      socket. `cacheprog` tries the daemon first and falls back to a
-      standalone disk store if none is running, so it works with zero
-      setup either way.
+      socket. `cacheprog` always keeps its own local disk tier and, if a
+      daemon is reachable, layers it in as a second tier (see
+      [`internal/cas/tiered`](internal/cas/tiered)): local is checked
+      first, the daemon is only consulted on a local miss, and the result
+      is written through to local so the next lookup for that action never
+      leaves the machine. Repeat local builds get local-disk speed even
+      with a daemon configured; a machine that's never built a given
+      action still gets it from the shared cache instead of recompiling.
 - [x] **LRU eviction** — `-max-size`/`-gc-interval` on `cacheserver`
       (background sweeps) or `-gc` on `cacheprog` (opt-in, direct mode).
 - [x] **Metrics / hit-rate dashboard** — `cacheserver -metrics-addr` serves
@@ -70,7 +75,8 @@ GOCACHEPROG="$(pwd)/cacheprog" go test ./...
 
 `cacheprog` looks for the daemon at a UID-namespaced path under the OS temp
 dir by default (see `internal/sockpath`); override with `-socket`, or force
-standalone mode with `-no-server`.
+local-only mode with `-no-server`. `-dir` is always used as the local tier,
+whether or not a daemon is also reachable.
 
 **Metrics:**
 
@@ -83,11 +89,14 @@ GOCACHEPROG="$(pwd)/cacheprog -stats" go build ./...
 # cacheprog: 42 gets (31 hits, 73.8% hit rate), 6 puts, 583291 bytes stored
 ```
 
-`-stats` only reports on direct-mode builds — when `cacheprog` reaches a
-daemon it just relays bytes, so use the daemon's own `-metrics-addr`
-instead. See [`internal/metrics`](internal/metrics) if you want to plug in
-your own backend (OTel, StatsD, ...) instead of the built-in counters —
-`Recorder` is a four-method interface, no SDK required.
+`-stats` reports on `cacheprog`'s own view of the request (which tier
+served it, or a daemon round trip that missed everywhere), for every build
+regardless of whether a daemon is reachable. `cacheserver -metrics-addr`
+reports only what actually reached the daemon, which will be less than the
+whole team's request volume once local tiers are warm — that's the point,
+not a discrepancy to chase down. See [`internal/metrics`](internal/metrics)
+if you want to plug in your own backend (OTel, StatsD, ...) instead of the
+built-in counters — `Recorder` is a four-method interface, no SDK required.
 
 ## Layout
 
@@ -96,9 +105,11 @@ cmd/
   cacheprog/     GOCACHEPROG entrypoint the go command invokes directly
   cacheserver/   shared daemon: one store, many connections
 internal/
-  protocol/       GOCACHEPROG wire types + request/response loop
+  protocol/       GOCACHEPROG wire types + request/response loop (Server) and a client (Client) for talking to another Server
   cas/             storage interface (Store) + protocol adapter (Handler)
   cas/disk/        disk-backed Store implementation
+  cas/remote/       Store that talks to a remote cacheserver via protocol.Client
+  cas/tiered/        Store composing a local + remote Store: local-first, remote fallback, write-through
   sockpath/        shared default socket path
   metrics/          Recorder hook + in-memory Counters, dashboard/Prometheus endpoints
 ```

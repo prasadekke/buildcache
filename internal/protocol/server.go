@@ -132,17 +132,24 @@ func (s *Server) readRequest() (*Request, error) {
 	return &req, nil
 }
 
-// readLine reads the next non-blank line from the input stream, skipping
-// blank lines along the way. The go command's ProgCache writes an extra
-// unconditional "\n" after every request's JSON line, on top of the one
-// json.Encoder.Encode already appends (see cmd/go/internal/cache/prog.go's
-// writeToChild). That leaves a blank line between every request -- and, for
-// a "put", between the request and its body line too -- which is protocol
-// noise to skip, not a signal that the stream has ended. Returns io.EOF only
-// once the stream is genuinely exhausted.
+// readLine reads the next non-blank line from the input stream. The go
+// command's ProgCache writes an extra unconditional "\n" after every
+// request's JSON line, on top of the one json.Encoder.Encode already
+// appends (see cmd/go/internal/cache/prog.go's writeToChild). That leaves a
+// blank line between every request -- and, for a "put", between the request
+// and its body line too -- which is protocol noise to skip, not a signal
+// that the stream has ended. See readNonBlankLine for the actual skipping
+// logic, shared with Client since Client talks to a Server too.
 func (s *Server) readLine() ([]byte, error) {
+	return readNonBlankLine(s.in)
+}
+
+// readNonBlankLine reads the next non-blank line from r, skipping any
+// number of blank lines along the way. Returns io.EOF only once the stream
+// is genuinely exhausted.
+func readNonBlankLine(r *bufio.Reader) ([]byte, error) {
 	for {
-		line, err := s.in.ReadBytes('\n')
+		line, err := r.ReadBytes('\n')
 		if len(line) == 0 && err != nil {
 			return nil, err // typically io.EOF
 		}

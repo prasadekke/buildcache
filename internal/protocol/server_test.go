@@ -261,10 +261,10 @@ func TestServer_GetHitAndMiss(t *testing.T) {
 	}
 }
 
-// TestServer_EOFWithoutClose covers cacheprog's proxy path (see
-// cmd/cacheprog's runProxy), which can end a connection via plain EOF
-// rather than a "close" request; Run must return cleanly, not treat this as
-// a protocol violation.
+// TestServer_EOFWithoutClose covers a client that hangs up mid-session
+// without ever sending "close" -- an abruptly killed go command, or a
+// cacheprog-to-cacheserver connection dropped mid-build. Run must return
+// cleanly in that case, not treat it as a protocol violation.
 func TestServer_EOFWithoutClose(t *testing.T) {
 	h := &fakeHandler{}
 	var in bytes.Buffer
