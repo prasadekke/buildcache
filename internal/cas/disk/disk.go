@@ -106,6 +106,14 @@ func (s *Store) Get(actionID []byte) (cas.Entry, bool, error) {
 
 // Put implements cas.Store.
 func (s *Store) Put(actionID, outputID []byte, body io.Reader, size int64) (string, error) {
+	if body == nil {
+		// The protocol layer always supplies a valid, possibly-empty
+		// Reader for a zero-byte body (see internal/protocol's readLine
+		// doc comment), but guard here too: a nil Reader reaching io.Copy
+		// panics, and a panic inside cacheserver's per-connection goroutine
+		// takes down the whole daemon, not just the one bad request.
+		body = bytes.NewReader(nil)
+	}
 	bodyPath, metaPath := s.paths(actionID)
 	if err := os.MkdirAll(filepath.Dir(bodyPath), 0o755); err != nil {
 		return "", fmt.Errorf("creating shard dir: %w", err)
