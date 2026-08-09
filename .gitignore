@@ -1,0 +1,26 @@
+# Build artifacts
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# This repo's own binaries, if built in place
+/cacheprog
+/cacheserver
+
+# Local cache/socket artifacts from manual testing
+*.sock
+.buildcache/
+
+# Go tooling
+/vendor/
+
+# Editor/OS cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local Claude Code config/notes, not part of the published repo
+.claude/
