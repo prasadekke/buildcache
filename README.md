@@ -39,18 +39,50 @@ frontend instead, since Cargo has no equivalent extension point.
       warm store, shared across many `cacheprog` invocations over a Unix
       socket. `cacheprog` always keeps its own local disk tier and, if a
       daemon is reachable, layers it in as a second tier (see
-      [`internal/cas/tiered`](internal/cas/tiered)): local is checked
-      first, the daemon is only consulted on a local miss, and the result
-      is written through to local so the next lookup for that action never
-      leaves the machine. Repeat local builds get local-disk speed even
-      with a daemon configured; a machine that's never built a given
-      action still gets it from the shared cache instead of recompiling.
+      [`internal/cas/tiered`](internal/cas/tiered)):
+      - **Reads (`Get`):** local is checked first; the daemon is only
+        consulted on a local miss, and a remote hit is written through to
+        local so the next lookup for that action never leaves the machine.
+      - **Writes (`Put`):** always written to local first — that's what the
+        build actually depends on — then best-effort pushed to the daemon
+        too, so the object is available to every other machine sharing it.
+        A slow or unreachable daemon delays or skips that push but never
+        fails the local write or the build.
+
+      Net effect: repeat local builds get local-disk speed even with a
+      daemon configured, and a machine that's never built a given action
+      before gets it from the shared cache instead of recompiling it.
 - [x] **LRU eviction** — `-max-size`/`-gc-interval` on `cacheserver`
       (background sweeps) or `-gc` on `cacheprog` (opt-in, direct mode).
 - [x] **Metrics / hit-rate dashboard** — `cacheserver -metrics-addr` serves
       a small dashboard at `/` and Prometheus-format metrics at `/metrics`;
       `cacheprog -stats` prints a one-line summary for direct-mode builds.
       No new dependencies — see [`internal/metrics`](internal/metrics).
+
+## Benchmarks
+
+Measured against [caddyserver/caddy](https://github.com/caddyserver/caddy)
+(47 packages), `go build ./...`:
+
+| Scenario | Wall time |
+|---|---|
+| Cold, no cache at all (today's reality on a fresh CI runner) | 1m 15s |
+| buildcache, fresh machine + a teammate's pre-warmed shared cache | 17.0s ± 3.3s |
+| Go's own local `GOCACHE`, warm, same-machine rebuild (the ceiling) | 16.9s ± 2.3s |
+
+(Warm numbers are mean ± stddev over 5 interleaved trials each — the two
+are statistically tied, not a real ranking.) A machine that has *never
+built this repo* lands within noise of a machine that's already fully
+warmed up locally, just by fetching from the shared cache instead of
+recompiling from scratch. That's the ~4.4x win in one row.
+
+One thing worth knowing going in: `GOCACHE` and `GOCACHEPROG` are mutually
+exclusive in the go command itself (`cmd/go/internal/cache/default.go`) —
+setting `GOCACHEPROG` at all means Go never touches your local `GOCACHE`,
+warm or not. `internal/cas/tiered` exists specifically to claw that local
+speed back at the buildcache layer instead: once an action has been
+fetched once, it's served straight from local disk on every subsequent
+build, without a daemon round trip.
 
 ## Usage
 
@@ -113,6 +145,24 @@ internal/
   sockpath/        shared default socket path
   metrics/          Recorder hook + in-memory Counters, dashboard/Prometheus endpoints
 ```
+
+## Testing
+
+```bash
+go test ./...          # full suite
+go test -race ./...    # with the race detector -- run this before touching the protocol package
+go vet ./...
+gofmt -l .
+```
+
+Coverage is concentrated where the actual logic lives (`internal/protocol`,
+`internal/cas/*`), not in `cmd/`'s thin flag-parsing wiring. Worth calling
+out: `internal/protocol`'s tests replicate the real go command's wire
+framing byte-for-byte (see `encodeLikeGoCommand` in `server_test.go`)
+rather than a simplified stand-in for it. That distinction is what let two
+real bugs — a blank-line framing mismatch and a zero-byte-body nil pointer,
+both invisible to hand-written smoke tests using simplified framing — ship
+silently before landing here as regression tests.
 
 ## Contributing
 
