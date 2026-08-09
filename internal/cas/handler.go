@@ -1,6 +1,6 @@
 package cas
 
-import "github.com/prasad-ekke/buildcache/internal/protocol"
+import "github.com/prasadekke/buildcache/internal/protocol"
 
 // Handler adapts a Store to protocol.Handler. It deliberately does not
 // implement Close: a Handler is often built around a Store that outlives

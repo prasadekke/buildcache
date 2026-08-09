@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/prasad-ekke/buildcache/internal/cas"
+	"github.com/prasadekke/buildcache/internal/cas"
 )
 
 // Store writes cache entries under a root directory, sharded by the first

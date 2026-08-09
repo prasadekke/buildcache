@@ -31,11 +31,11 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/prasad-ekke/buildcache/internal/cas"
-	"github.com/prasad-ekke/buildcache/internal/cas/disk"
-	"github.com/prasad-ekke/buildcache/internal/metrics"
-	"github.com/prasad-ekke/buildcache/internal/protocol"
-	"github.com/prasad-ekke/buildcache/internal/sockpath"
+	"github.com/prasadekke/buildcache/internal/cas"
+	"github.com/prasadekke/buildcache/internal/cas/disk"
+	"github.com/prasadekke/buildcache/internal/metrics"
+	"github.com/prasadekke/buildcache/internal/protocol"
+	"github.com/prasadekke/buildcache/internal/sockpath"
 )
 
 func main() {

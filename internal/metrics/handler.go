@@ -3,7 +3,7 @@ package metrics
 import (
 	"time"
 
-	"github.com/prasad-ekke/buildcache/internal/protocol"
+	"github.com/prasadekke/buildcache/internal/protocol"
 )
 
 // WrapHandler returns a protocol.Handler that delegates every Get/Put to h,
