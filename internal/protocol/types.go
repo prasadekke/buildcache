@@ -22,6 +22,11 @@ import (
 	"time"
 )
 
+// ProtocolVersion is the version of buildcache's extensions to the
+// GOCACHEPROG protocol (inline "get" bodies, StoreDir). Bump it whenever
+// the framing between two buildcache processes changes incompatibly.
+const ProtocolVersion = 1
+
 // Cmd identifies the kind of request the go command is issuing.
 type Cmd string
 
@@ -81,6 +86,20 @@ type Response struct {
 	// every Cmd this program is willing to handle.
 	KnownCommands []Cmd `json:",omitempty"`
 
+	// Version is buildcache's own wire-protocol version (ProtocolVersion),
+	// set only in the startup message. The go command ignores it; Client
+	// refuses to talk to a Server announcing a different one, since
+	// buildcache's extensions (see Body) change the framing and a
+	// mismatched pair would silently desync rather than fail cleanly.
+	Version int `json:",omitempty"`
+
+	// StoreDir is the server's cache directory, set only in the startup
+	// message and only when the server chooses to advertise it (cacheserver
+	// does on its same-machine Unix socket). It lets a same-machine client
+	// notice it would otherwise be layering a store on top of itself --
+	// see cmd/cacheprog.
+	StoreDir string `json:",omitempty"`
+
 	// Get-specific fields.
 	Miss     bool       `json:",omitempty"`
 	OutputID []byte     `json:",omitempty"`
@@ -90,5 +109,35 @@ type Response struct {
 	// DiskPath is the absolute local path to the body for a cache hit
 	// ("get") or the just-stored object ("put"). By convention the file
 	// has no extension.
+	//
+	// This is only valid to read on the machine that received this
+	// Response. On the go-command-facing leg that's always true (a
+	// GOCACHEPROG subprocess is always local). It is *not* generally true
+	// on the cacheprog-to-cacheserver leg once cacheserver is reachable
+	// over the network rather than a same-machine Unix socket -- see Body.
 	DiskPath string `json:",omitempty"`
+
+	// BodyInline marks whether Body is present on the wire. BodySize alone
+	// cannot serve as that marker because zero-byte cache objects are valid
+	// and still need an inline body line when DiskPath is remote-only.
+	BodyInline bool `json:",omitempty"`
+
+	// Body and BodySize optionally carry the object's bytes inline on a
+	// "get" hit, the same way a "put" request already carries its body: a
+	// base64-encoded line immediately following this Response's JSON line
+	// when BodyInline is true. The real go command never expects or reads
+	// this (its GOCACHEPROG subprocess is always local, so DiskPath alone is
+	// always sufficient) -- these fields exist for the cacheprog-to-
+	// cacheserver leg only, where both ends are buildcache processes. This
+	// extension is not part of the GOCACHEPROG spec: a generic decoder would
+	// ignore BodyInline but would not know to consume the extra body line.
+	//
+	// cacheserver only populates these for connections where DiskPath
+	// might not be locally readable by the caller -- see
+	// internal/cas.InlineGetBodies -- never for a same-machine Unix
+	// socket, where they'd just be wasted work. internal/cas/remote.Store
+	// is the reader: when present, it materializes Body to a local file
+	// and reports *that* path instead of trusting DiskPath verbatim.
+	Body     io.Reader `json:"-"`
+	BodySize int64     `json:",omitempty"`
 }

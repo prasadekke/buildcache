@@ -1,0 +1,13 @@
+repo,commit,label,scenario,trial,wall_seconds,gets,hits,hit_rate_pct,puts,put_bytes
+/tmp/synth-repo,6aa0f34bdda7cea33116fe4f098d6ceb21faff77,synth-validation,cold_no_cache,1,9.086,0,0,0,0,0
+/tmp/synth-repo,6aa0f34bdda7cea33116fe4f098d6ceb21faff77,synth-validation,cold_no_cache,2,9.443,0,0,0,0,0
+/tmp/synth-repo,6aa0f34bdda7cea33116fe4f098d6ceb21faff77,synth-validation,cold_no_cache,3,9.455,0,0,0,0,0
+/tmp/synth-repo,6aa0f34bdda7cea33116fe4f098d6ceb21faff77,synth-validation,buildcache_fresh_machine_shared_warm,1,0.321,176,175,99.4,1,0
+/tmp/synth-repo,6aa0f34bdda7cea33116fe4f098d6ceb21faff77,synth-validation,buildcache_fresh_machine_shared_warm,2,0.370,176,175,99.4,1,0
+/tmp/synth-repo,6aa0f34bdda7cea33116fe4f098d6ceb21faff77,synth-validation,buildcache_fresh_machine_shared_warm,3,0.400,176,175,99.4,1,0
+/tmp/synth-repo,6aa0f34bdda7cea33116fe4f098d6ceb21faff77,synth-validation,local_gocache_warm,1,0.220,0,0,0,0,0
+/tmp/synth-repo,6aa0f34bdda7cea33116fe4f098d6ceb21faff77,synth-validation,buildcache_local_tier_warm,1,0.228,176,175,99.4,1,0
+/tmp/synth-repo,6aa0f34bdda7cea33116fe4f098d6ceb21faff77,synth-validation,local_gocache_warm,2,0.209,0,0,0,0,0
+/tmp/synth-repo,6aa0f34bdda7cea33116fe4f098d6ceb21faff77,synth-validation,buildcache_local_tier_warm,2,0.228,176,175,99.4,1,0
+/tmp/synth-repo,6aa0f34bdda7cea33116fe4f098d6ceb21faff77,synth-validation,local_gocache_warm,3,0.211,0,0,0,0,0
+/tmp/synth-repo,6aa0f34bdda7cea33116fe4f098d6ceb21faff77,synth-validation,buildcache_local_tier_warm,3,0.227,176,175,99.4,1,0

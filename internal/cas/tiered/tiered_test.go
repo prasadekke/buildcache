@@ -3,6 +3,7 @@ package tiered_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -184,6 +185,7 @@ func TestPut_WritesLocalAndRemote(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
+	s.Flush() // the remote push happens in the background
 	if gotPath != localPath {
 		t.Errorf("Put returned %q, want the local path %q", gotPath, localPath)
 	}
@@ -233,6 +235,7 @@ func TestPut_RemoteFailureIsNonFatal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Put err = %v, want nil (a remote failure shouldn't fail the Put)", err)
 	}
+	s.Flush()
 	if gotPath != localPath {
 		t.Errorf("Put returned %q, want the local path %q despite the remote failure", gotPath, localPath)
 	}
@@ -241,7 +244,11 @@ func TestPut_RemoteFailureIsNonFatal(t *testing.T) {
 	}
 }
 
-func TestGet_RemoteHitWithUnopenableDiskPathServesFromRemote(t *testing.T) {
+// TestGet_RemoteHitWithUnopenableDiskPathIsAMiss is the regression test
+// for handing the go command a path tiered had just failed to open (e.g.
+// because the server evicted it between its Get and ours): the go command
+// can't read it either, so it must be reported as a miss.
+func TestGet_RemoteHitWithUnopenableDiskPathIsAMiss(t *testing.T) {
 	local := &fakeStore{}
 	remoteEntry := cas.Entry{OutputID: []byte("out"), Size: 3, DiskPath: filepath.Join(t.TempDir(), "does-not-exist")}
 	remote := &fakeStore{getFunc: func([]byte) (cas.Entry, bool, error) { return remoteEntry, true, nil }}
@@ -250,10 +257,10 @@ func TestGet_RemoteHitWithUnopenableDiskPathServesFromRemote(t *testing.T) {
 
 	entry, ok, err := s.Get([]byte("a"))
 	if err != nil {
-		t.Fatalf("Get err = %v, want nil (an unopenable remote hit should still be served from remote)", err)
+		t.Fatalf("Get err = %v, want nil", err)
 	}
-	if !ok || entry.DiskPath != remoteEntry.DiskPath {
-		t.Errorf("entry = %+v ok=%v, want the remote entry served as-is", entry, ok)
+	if ok {
+		t.Errorf("Get = %+v ok=true, want a miss for a remote path that can't be opened", entry)
 	}
 	if local.putCalls != 0 {
 		t.Errorf("local.Put called %d times, want 0 (nothing to write through when the remote file can't be opened)", local.putCalls)
@@ -301,6 +308,7 @@ func TestPut_UnopenableLocalPathSkipsRemotePush(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Put err = %v, want nil (an unopenable local path shouldn't fail the Put itself)", err)
 	}
+	s.Flush()
 	if gotPath != "/does/not/exist" {
 		t.Errorf("Put returned %q, want the local path returned even though it couldn't be reopened", gotPath)
 	}
@@ -335,5 +343,125 @@ func TestClose_RemoteErrorStillClosesLocal(t *testing.T) {
 	}
 	if !local.closed {
 		t.Error("local was not closed despite the remote failing to close")
+	}
+}
+
+// fetchingStore is a fakeStore that also implements cas.Fetcher, the way
+// remote.Store does for inline-body hits.
+type fetchingStore struct {
+	fakeStore
+	fetchFunc func([]byte) (cas.Entry, io.Reader, bool, error)
+}
+
+func (f *fetchingStore) Fetch(actionID []byte) (cas.Entry, io.Reader, bool, error) {
+	f.getCalls++
+	return f.fetchFunc(actionID)
+}
+
+func TestGet_FetchedBodyWritesStraightToLocal(t *testing.T) {
+	var localBody []byte
+	local := &fakeStore{putFunc: func(_, _ []byte, body io.Reader, _ int64) (string, error) {
+		localBody, _ = io.ReadAll(body)
+		return "/local/path", nil
+	}}
+	remote := &fetchingStore{fetchFunc: func([]byte) (cas.Entry, io.Reader, bool, error) {
+		return cas.Entry{OutputID: []byte("out"), Size: 5}, bytes.NewReader([]byte("bytes")), true, nil
+	}}
+	s := &tiered.Store{Local: local, Remote: remote}
+
+	entry, ok, err := s.Get([]byte("a"))
+	if err != nil || !ok {
+		t.Fatalf("Get: ok=%v err=%v", ok, err)
+	}
+	if entry.DiskPath != "/local/path" || string(localBody) != "bytes" {
+		t.Errorf("entry.DiskPath=%q local body=%q, want the fetched bytes written to /local/path", entry.DiskPath, localBody)
+	}
+}
+
+func TestGet_FetchedBodyLocalWriteFailureIsAMiss(t *testing.T) {
+	local := &fakeStore{putFunc: func([]byte, []byte, io.Reader, int64) (string, error) { return "", errors.New("disk full") }}
+	remote := &fetchingStore{fetchFunc: func([]byte) (cas.Entry, io.Reader, bool, error) {
+		return cas.Entry{OutputID: []byte("out"), Size: 1}, bytes.NewReader([]byte("x")), true, nil
+	}}
+	s := &tiered.Store{Local: local, Remote: remote}
+
+	if _, ok, err := s.Get([]byte("a")); ok || err != nil {
+		t.Fatalf("Get = ok %v err %v, want a plain miss (there's no file to serve instead)", ok, err)
+	}
+}
+
+// TestRemoteUnavailableIsSkippedAfterwards: once Remote reports
+// cas.ErrUnavailable, neither Gets nor Puts should touch it again -- each
+// would just fail the same way, paying a timeout and a log line apiece.
+func TestRemoteUnavailableIsSkippedAfterwards(t *testing.T) {
+	local := &fakeStore{}
+	remote := &fakeStore{getFunc: func([]byte) (cas.Entry, bool, error) {
+		return cas.Entry{}, false, fmt.Errorf("%w: connection reset", cas.ErrUnavailable)
+	}}
+	var logs int
+	s := &tiered.Store{Local: local, Remote: remote, Logf: func(string, ...any) { logs++ }}
+
+	for i := 0; i < 3; i++ {
+		if _, ok, err := s.Get([]byte("a")); ok || err != nil {
+			t.Fatalf("Get #%d = ok %v err %v, want a plain miss", i, ok, err)
+		}
+	}
+	if _, err := s.Put([]byte("a"), []byte("out"), bytes.NewReader([]byte("x")), 1); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	s.Flush()
+	if remote.getCalls != 1 || remote.putCalls != 0 {
+		t.Errorf("remote saw %d gets / %d puts, want 1 / 0 (skipped once unavailable)", remote.getCalls, remote.putCalls)
+	}
+	if logs != 1 {
+		t.Errorf("logged %d times, want once", logs)
+	}
+}
+
+func TestPut_ReadOnlyRemoteStopsPushing(t *testing.T) {
+	dir := t.TempDir()
+	local := &fakeStore{putFunc: func(actionID, _ []byte, body io.Reader, _ int64) (string, error) {
+		p := filepath.Join(dir, string(actionID))
+		b, _ := io.ReadAll(body)
+		return p, os.WriteFile(p, b, 0o644)
+	}}
+	remote := &fakeStore{putFunc: func([]byte, []byte, io.Reader, int64) (string, error) {
+		return "", fmt.Errorf("remote put: %w", cas.ErrReadOnly)
+	}}
+	s := &tiered.Store{Local: local, Remote: remote}
+
+	for _, id := range []string{"a", "b", "c"} {
+		if _, err := s.Put([]byte(id), []byte("out"), bytes.NewReader([]byte("x")), 1); err != nil {
+			t.Fatalf("Put(%s): %v", id, err)
+		}
+		s.Flush()
+	}
+	if remote.putCalls != 1 {
+		t.Errorf("remote.Put called %d times, want 1 (pushing stops once the remote says it's read-only)", remote.putCalls)
+	}
+}
+
+func TestClose_DrainsQueuedUploads(t *testing.T) {
+	dir := t.TempDir()
+	localPath := filepath.Join(dir, "body")
+	local := &fakeStore{putFunc: func(_, _ []byte, body io.Reader, _ int64) (string, error) {
+		b, _ := io.ReadAll(body)
+		return localPath, os.WriteFile(localPath, b, 0o644)
+	}}
+	remote := &fakeStore{}
+	s := &tiered.Store{Local: local, Remote: remote}
+
+	if _, err := s.Put([]byte("a"), []byte("out"), bytes.NewReader([]byte("x")), 1); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if remote.putCalls != 1 {
+		t.Errorf("remote.Put called %d times, want 1 (Close must finish queued uploads before closing the remote)", remote.putCalls)
+	}
+	// A Put after Close mustn't panic on the closed queue.
+	if _, err := s.Put([]byte("b"), []byte("out"), bytes.NewReader([]byte("x")), 1); err != nil {
+		t.Fatalf("Put after Close: %v", err)
 	}
 }

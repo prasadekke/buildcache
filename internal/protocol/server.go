@@ -3,8 +3,8 @@ package protocol
 import (
 	"bufio"
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -27,6 +27,23 @@ type Handler interface {
 // Server runs the GOCACHEPROG read/dispatch/write loop.
 type Server struct {
 	Handler Handler
+
+	// StoreDir, if set, is advertised in the startup message (see
+	// Response.StoreDir). Leave it empty unless the peer is on the same
+	// machine and could make use of it.
+	StoreDir string
+
+	// ReadOnly makes the server advertise only "get" and "close", and
+	// reject any "put" it receives anyway. The go command already treats a
+	// server without "put" as a read-only cache; cacheserver uses this for
+	// mTLS clients whose certificate only grants read access.
+	ReadOnly bool
+
+	// MaxBodySize, if > 0, is the largest "put" body the server will
+	// accept. A larger declared size ends the session with an error rather
+	// than buffering the body: the body line can't be skipped without
+	// reading it, so there's no way to reject just that one request.
+	MaxBodySize int64
 
 	in    *bufio.Reader
 	out   io.Writer
@@ -56,7 +73,12 @@ func NewServer(in io.Reader, out io.Writer, h Handler) *Server {
 // concurrent writes) is the natural next step and is left as a TODO here on
 // purpose rather than guessed at prematurely.
 func (s *Server) Run() error {
-	if err := s.writeResponse(&Response{ID: 0, KnownCommands: []Cmd{CmdGet, CmdPut, CmdClose}}); err != nil {
+	known := []Cmd{CmdGet, CmdPut, CmdClose}
+	if s.ReadOnly {
+		known = []Cmd{CmdGet, CmdClose}
+	}
+	startup := &Response{ID: 0, KnownCommands: known, Version: ProtocolVersion, StoreDir: s.StoreDir}
+	if err := s.writeResponse(startup); err != nil {
 		return fmt.Errorf("writing startup response: %w", err)
 	}
 
@@ -74,7 +96,11 @@ func (s *Server) Run() error {
 		case CmdGet:
 			err = s.Handler.Get(req, resp)
 		case CmdPut:
-			err = s.Handler.Put(req, resp)
+			if s.ReadOnly {
+				err = errors.New("put rejected: this connection is read-only")
+			} else {
+				err = s.Handler.Put(req, resp)
+			}
 		case CmdClose:
 			return s.writeResponse(resp) // ack, then exit per protocol
 		default:
@@ -103,6 +129,12 @@ func (s *Server) readRequest() (*Request, error) {
 	}
 
 	if req.Command == CmdPut {
+		if req.BodySize < 0 {
+			return nil, fmt.Errorf("put request %d: negative BodySize %d", req.ID, req.BodySize)
+		}
+		if s.MaxBodySize > 0 && req.BodySize > s.MaxBodySize {
+			return nil, fmt.Errorf("put request %d: BodySize %d exceeds the %d-byte limit", req.ID, req.BodySize, s.MaxBodySize)
+		}
 		if req.BodySize == 0 {
 			// No body line follows for a zero-byte body (see readLine's doc
 			// comment), but the body is still a legitimate empty object,
@@ -110,22 +142,11 @@ func (s *Server) readRequest() (*Request, error) {
 			// rather than leaving req.Body nil.
 			req.Body = bytes.NewReader(nil)
 		} else {
-			bodyLine, bErr := s.readLine()
-			if bErr != nil {
-				return nil, fmt.Errorf("reading body line: %w", bErr)
+			body, err := decodeBodyLine(s.in, req.BodySize)
+			if err != nil {
+				return nil, err
 			}
-			var encoded string
-			if jsonErr := json.Unmarshal(bodyLine, &encoded); jsonErr != nil {
-				return nil, fmt.Errorf("decoding body line: %w", jsonErr)
-			}
-			decoded, decErr := base64.StdEncoding.DecodeString(encoded)
-			if decErr != nil {
-				return nil, fmt.Errorf("base64-decoding body: %w", decErr)
-			}
-			if int64(len(decoded)) != req.BodySize {
-				return nil, fmt.Errorf("body size mismatch: got %d bytes, want %d", len(decoded), req.BodySize)
-			}
-			req.Body = bytes.NewReader(decoded)
+			req.Body = body
 		}
 	}
 
@@ -141,32 +162,34 @@ func (s *Server) readRequest() (*Request, error) {
 // that the stream has ended. See readNonBlankLine for the actual skipping
 // logic, shared with Client since Client talks to a Server too.
 func (s *Server) readLine() ([]byte, error) {
-	return readNonBlankLine(s.in)
+	return readNonBlankLine(s.in, maxControlLine)
 }
 
-// readNonBlankLine reads the next non-blank line from r, skipping any
-// number of blank lines along the way. Returns io.EOF only once the stream
-// is genuinely exhausted.
-func readNonBlankLine(r *bufio.Reader) ([]byte, error) {
-	for {
-		line, err := r.ReadBytes('\n')
-		if len(line) == 0 && err != nil {
-			return nil, err // typically io.EOF
-		}
-		if err != nil && err != io.EOF {
-			return nil, err
-		}
-		if len(bytes.TrimSpace(line)) == 0 {
-			if err == io.EOF {
-				return nil, io.EOF
-			}
-			continue
-		}
-		return line, nil
-	}
-}
-
+// writeResponse writes resp's JSON line and, if resp.BodyInline is true (see
+// Response.Body's doc comment), the inline body line immediately after it
+// -- both under the same lock, so a concurrent writeResponse from another
+// goroutine can never interleave its own line in between the two. The body
+// is streamed rather than encoded into memory first; if resp.Body is an
+// io.Closer (cas.InlineGetBodies hands over an open file), it's closed once
+// written.
+//
+// A body that turns out to be unusable before anything is written (wrong
+// size, unreadable) is reported to the peer as an error response for that
+// one request instead of ending the whole session.
 func (s *Server) writeResponse(resp *Response) error {
+	if c, ok := resp.Body.(io.Closer); ok {
+		defer c.Close()
+	}
+	var body io.Reader
+	if resp.BodyInline {
+		b, err := checkBody(resp.Body, resp.BodySize)
+		if err != nil {
+			resp = &Response{ID: resp.ID, Err: fmt.Sprintf("encoding response body: %v", err)}
+		} else {
+			body = b
+		}
+	}
+
 	s.outMu.Lock()
 	defer s.outMu.Unlock()
 
@@ -175,6 +198,17 @@ func (s *Server) writeResponse(resp *Response) error {
 		return err
 	}
 	b = append(b, '\n')
-	_, err = s.out.Write(b)
-	return err
+	if body == nil {
+		_, err := s.out.Write(b)
+		return err
+	}
+
+	bw := bufio.NewWriterSize(s.out, 64<<10)
+	if _, err := bw.Write(b); err != nil {
+		return err
+	}
+	if err := writeBodyLine(bw, body, resp.BodySize); err != nil {
+		return fmt.Errorf("writing response body: %w", err)
+	}
+	return bw.Flush()
 }

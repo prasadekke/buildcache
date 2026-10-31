@@ -2,6 +2,7 @@ package disk
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -138,10 +139,10 @@ func TestGet_OrphanedMetaWithoutBody(t *testing.T) {
 
 	actionID := []byte("orphan-action")
 	body := []byte("x")
-	if _, err := s.Put(actionID, []byte("out"), bytes.NewReader(body), int64(len(body))); err != nil {
+	bodyPath, err := s.Put(actionID, []byte("out"), bytes.NewReader(body), int64(len(body)))
+	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	bodyPath, _ := s.paths(actionID)
 	if err := os.Remove(bodyPath); err != nil {
 		t.Fatalf("removing body to simulate an orphaned meta: %v", err)
 	}
@@ -163,10 +164,10 @@ func TestGet_BumpsMtimeOnHit(t *testing.T) {
 	defer s.Close()
 
 	actionID := []byte("mtime-action")
-	if _, err := s.Put(actionID, []byte("out"), bytes.NewReader([]byte("x")), 1); err != nil {
+	bodyPath, err := s.Put(actionID, []byte("out"), bytes.NewReader([]byte("x")), 1)
+	if err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	bodyPath, _ := s.paths(actionID)
 
 	old := time.Now().Add(-time.Hour)
 	if err := os.Chtimes(bodyPath, old, old); err != nil {
@@ -202,10 +203,10 @@ func TestEvict_KeepsMostRecentlyUsed(t *testing.T) {
 	base := time.Now().Add(-time.Hour)
 	for i, name := range entries {
 		actionID := []byte(name)
-		if _, err := s.Put(actionID, []byte("out-"+name), bytes.NewReader(body), sizes); err != nil {
+		bodyPath, err := s.Put(actionID, []byte("out-"+name), bytes.NewReader(body), sizes)
+		if err != nil {
 			t.Fatalf("Put(%s): %v", name, err)
 		}
-		bodyPath, _ := s.paths(actionID)
 		mt := base.Add(time.Duration(i) * time.Minute)
 		if err := os.Chtimes(bodyPath, mt, mt); err != nil {
 			t.Fatalf("Chtimes(%s): %v", name, err)
@@ -265,15 +266,20 @@ func TestEvict_RemovesOrphansRegardlessOfCap(t *testing.T) {
 		t.Fatalf("Put: %v", err)
 	}
 
-	// An orphaned body (meta removed) should be swept unconditionally, even
-	// with a cap large enough that nothing else needs evicting.
-	orphanBodyPath, _ := s.paths([]byte("orphan-body"))
+	// An orphaned body (no meta refers to it) should be swept
+	// unconditionally once it's older than the grace period, even with a
+	// cap large enough that nothing else needs evicting.
+	orphanBodyPath := s.bodyPath([]byte("orphan-body"), []byte("out"))
 	if err := os.MkdirAll(filepath.Dir(orphanBodyPath), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 	orphanBytes := []byte("orphan bytes")
 	if err := os.WriteFile(orphanBodyPath, orphanBytes, 0o644); err != nil {
 		t.Fatalf("writing orphan body: %v", err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(orphanBodyPath, old, old); err != nil {
+		t.Fatalf("Chtimes: %v", err)
 	}
 
 	freed, err := s.Evict(1 << 20)
@@ -318,7 +324,7 @@ func TestGet_MetaReadError(t *testing.T) {
 	defer s.Close()
 
 	actionID := []byte("dir-instead-of-meta")
-	_, metaPath := s.paths(actionID)
+	metaPath := s.metaPath(actionID)
 	if err := os.MkdirAll(metaPath, 0o755); err != nil {
 		t.Fatalf("mkdir at meta path: %v", err)
 	}
@@ -336,7 +342,7 @@ func TestGet_CorruptedMetaJSON(t *testing.T) {
 	defer s.Close()
 
 	actionID := []byte("corrupt-meta")
-	bodyPath, metaPath := s.paths(actionID)
+	bodyPath, metaPath := s.legacyBodyPath(actionID), s.metaPath(actionID)
 	if err := os.MkdirAll(filepath.Dir(bodyPath), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -360,7 +366,7 @@ func TestGet_CorruptedOutputIDHex(t *testing.T) {
 	defer s.Close()
 
 	actionID := []byte("bad-output-id")
-	bodyPath, metaPath := s.paths(actionID)
+	bodyPath, metaPath := s.legacyBodyPath(actionID), s.metaPath(actionID)
 	if err := os.MkdirAll(filepath.Dir(bodyPath), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -385,7 +391,7 @@ func TestPut_WriteBodyFailure(t *testing.T) {
 	defer s.Close()
 
 	actionID := []byte("body-path-is-a-dir")
-	bodyPath, _ := s.paths(actionID)
+	bodyPath := s.bodyPath(actionID, []byte("out"))
 	if err := os.MkdirAll(bodyPath, 0o755); err != nil {
 		t.Fatalf("mkdir at body path: %v", err)
 	}
@@ -476,5 +482,185 @@ func TestPutGet_ConcurrentSafety(t *testing.T) {
 		if entry.Size != 100 {
 			t.Errorf("Get(%d).Size = %d, want 100", i, entry.Size)
 		}
+	}
+}
+
+// TestEvict_SparesFreshOrphanBody is the regression test for the Put/Evict
+// race: a sweep running between a Put's body write and its meta write
+// sees a body no meta refers to yet. It must leave that body alone, or the
+// Put returns a DiskPath that no longer exists.
+func TestEvict_SparesFreshOrphanBody(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer s.Close()
+
+	// Exactly the on-disk state mid-Put: body renamed into place, no meta.
+	bodyPath := s.bodyPath([]byte("in-flight"), []byte("out"))
+	if err := os.MkdirAll(filepath.Dir(bodyPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(bodyPath, []byte("still being put"), 0o644); err != nil {
+		t.Fatalf("writing body: %v", err)
+	}
+
+	if _, err := s.Evict(0); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+	if _, err := os.Stat(bodyPath); err != nil {
+		t.Fatalf("in-flight body was removed by Evict: %v", err)
+	}
+}
+
+func TestEvict_SparesRecentlyUsedEvenOverCap(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer s.Close()
+
+	if _, err := s.Put([]byte("hot"), []byte("out"), bytes.NewReader([]byte("0123456789")), 10); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	freed, err := s.Evict(0)
+	if err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+	if freed != 0 {
+		t.Errorf("freed = %d, want 0 (the only entry was just used)", freed)
+	}
+	if _, ok, _ := s.Get([]byte("hot")); !ok {
+		t.Error("recently used entry was evicted despite the grace period")
+	}
+
+	s.EvictGrace = 0
+	if freed, err := s.Evict(0); err != nil || freed != 10 {
+		t.Errorf("Evict with no grace: freed=%d err=%v, want 10 bytes freed", freed, err)
+	}
+}
+
+func TestEvict_RemovesStaleTempAndOrphanMeta(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer s.Close()
+
+	bodyPath, err := s.Put([]byte("gone"), []byte("out"), bytes.NewReader([]byte("x")), 1)
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	os.Remove(bodyPath)
+	metaPath := s.metaPath([]byte("gone"))
+
+	tmpPath := filepath.Join(filepath.Dir(metaPath), tmpPrefix+"abandoned")
+	if err := os.WriteFile(tmpPath, []byte("half a put"), 0o644); err != nil {
+		t.Fatalf("writing temp file: %v", err)
+	}
+	old := time.Now().Add(-time.Hour)
+	for _, p := range []string{metaPath, tmpPath} {
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatalf("Chtimes(%s): %v", p, err)
+		}
+	}
+
+	if _, err := s.Evict(1 << 20); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+	for _, p := range []string{metaPath, tmpPath} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("%s still exists after Evict, want it swept as debris", p)
+		}
+	}
+}
+
+// TestGet_MetaAlwaysMatchesItsBody covers the interleaving that a single
+// per-action body file allowed: two Puts of one action with different
+// outputs, whose meta writes land in the opposite order from their body
+// writes. Whichever meta wins, Get must return that meta's own bytes.
+func TestGet_MetaAlwaysMatchesItsBody(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer s.Close()
+
+	actionID := []byte("nondeterministic")
+	if _, err := s.Put(actionID, []byte("out-a"), bytes.NewReader([]byte("AAAA")), 4); err != nil {
+		t.Fatalf("Put A: %v", err)
+	}
+	metaA, err := os.ReadFile(s.metaPath(actionID))
+	if err != nil {
+		t.Fatalf("reading meta A: %v", err)
+	}
+	if _, err := s.Put(actionID, []byte("out-b"), bytes.NewReader([]byte("BBBBBB")), 6); err != nil {
+		t.Fatalf("Put B: %v", err)
+	}
+	// Simulate A's meta write landing last.
+	if err := os.WriteFile(s.metaPath(actionID), metaA, 0o644); err != nil {
+		t.Fatalf("restoring meta A: %v", err)
+	}
+
+	entry, ok, err := s.Get(actionID)
+	if err != nil || !ok {
+		t.Fatalf("Get: ok=%v err=%v", ok, err)
+	}
+	got, err := os.ReadFile(entry.DiskPath)
+	if err != nil {
+		t.Fatalf("reading DiskPath: %v", err)
+	}
+	if string(entry.OutputID) != "out-a" || string(got) != "AAAA" || entry.Size != 4 {
+		t.Errorf("Get = OutputID %q, body %q, size %d; want out-a's own body AAAA (4 bytes)", entry.OutputID, got, entry.Size)
+	}
+}
+
+func TestGet_LegacyLayoutStillReadable(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer s.Close()
+
+	actionID := []byte("from-before")
+	bodyPath := s.legacyBodyPath(actionID)
+	if err := os.MkdirAll(filepath.Dir(bodyPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(bodyPath, []byte("old bytes"), 0o644); err != nil {
+		t.Fatalf("writing legacy body: %v", err)
+	}
+	mb, _ := json.Marshal(map[string]any{"OutputID": "6f6c64", "Time": time.Now().UTC()})
+	if err := os.WriteFile(s.metaPath(actionID), mb, 0o644); err != nil {
+		t.Fatalf("writing legacy meta: %v", err)
+	}
+
+	entry, ok, err := s.Get(actionID)
+	if err != nil || !ok {
+		t.Fatalf("Get legacy entry: ok=%v err=%v", ok, err)
+	}
+	if entry.DiskPath != bodyPath || string(entry.OutputID) != "old" {
+		t.Errorf("entry = %+v, want the legacy body at %s with OutputID \"old\"", entry, bodyPath)
+	}
+}
+
+func TestGet_RejectsMetaNamingBodyOutsideShard(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer s.Close()
+
+	actionID := []byte("escape")
+	metaPath := s.metaPath(actionID)
+	if err := os.MkdirAll(filepath.Dir(metaPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	mb, _ := json.Marshal(meta{OutputID: "00", Time: time.Now(), Body: "../../etc/passwd.body"})
+	if err := os.WriteFile(metaPath, mb, 0o644); err != nil {
+		t.Fatalf("writing meta: %v", err)
+	}
+	if _, _, err := s.Get(actionID); err == nil {
+		t.Fatal("Get err = nil, want an error for a meta whose Body escapes the shard directory")
 	}
 }

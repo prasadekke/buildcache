@@ -9,9 +9,31 @@
 package cas
 
 import (
+	"errors"
 	"io"
 	"time"
 )
+
+// ErrUnavailable marks an error from a Store whose backend can no longer
+// be reached at all (a dead or desynced connection), as opposed to one
+// that failed a single request. Callers layering Stores (see
+// internal/cas/tiered) use it to stop consulting that backend for the rest
+// of its lifetime instead of failing slowly on every remaining call.
+var ErrUnavailable = errors.New("store unavailable")
+
+// ErrReadOnly marks a Put rejected because the Store only permits reads.
+var ErrReadOnly = errors.New("store is read-only")
+
+// Fetcher is optionally implemented by Stores whose hits can arrive as
+// bytes in memory rather than as a local file (see internal/cas/remote).
+// Fetch is like Get, except that on a hit it may return the content as
+// body with entry.DiskPath left empty, so a caller that's about to copy
+// the bytes into another Store anyway (internal/cas/tiered) can skip
+// materializing a temporary file first. When body is nil, entry.DiskPath
+// is set exactly as Get would set it.
+type Fetcher interface {
+	Fetch(actionID []byte) (entry Entry, body io.Reader, ok bool, err error)
+}
 
 // Entry is what a Store returns on a cache hit.
 type Entry struct {

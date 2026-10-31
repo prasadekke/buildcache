@@ -21,44 +21,101 @@ import (
 
 // Store writes cache entries under a root directory, sharded by the first
 // byte of the action ID's hex encoding so no single directory grows
-// unbounded. For an entry with action ID "ab12...":
+// unbounded. For an entry with action ID "ab12..." and output ID "cd34...":
 //
-//	<root>/ab/ab12....body  -- the raw bytes passed to Put
-//	<root>/ab/ab12....meta  -- JSON: {"OutputID": "<hex>", "Time": "..."}
+//	<root>/ab/ab12....meta         -- JSON: {"OutputID": "<hex>", "Time": "...", "Body": "ab12...-cd34....body"}
+//	<root>/ab/ab12...-cd34....body -- the raw bytes passed to Put
+//
+// The body is named for its (action, output) pair, and the meta records
+// which body it describes, so a meta can never end up pointing at another
+// Put's bytes: two concurrent Puts of the same action with different
+// outputs write two different body files, and whichever meta lands last
+// still names its own. (With a single "<action>.body" per action, the two
+// writes could interleave as body A, body B, meta B, meta A -- leaving
+// meta A's OutputID attached to body B's content.) A meta without a Body
+// field, from before this layout, refers to the legacy "<action>.body".
 //
 // A single Store is safe to share across goroutines and across separate
 // OS processes: all writes go through writeAtomic (temp file + rename), so
 // concurrent Gets never observe a partially written entry.
 type Store struct {
 	root string
+
+	// EvictGrace protects anything modified more recently than this from
+	// Evict: entries used within it (Get bumps a body's mtime), and
+	// orphaned or temporary files that may simply belong to a Put still in
+	// progress. Without it, a sweep that runs between a Put's body and
+	// meta writes would see a body with no meta yet and delete it out from
+	// under the Put that's about to return its path. New sets it to
+	// DefaultEvictGrace.
+	EvictGrace time.Duration
 }
+
+// DefaultEvictGrace is EvictGrace's default. The go command's own guidance
+// (cmd/go/internal/cache.Cache's Close doc) is never to trim anything used
+// recently by another process, since it may still be about to read a path
+// it was just handed.
+const DefaultEvictGrace = 10 * time.Minute
 
 // New returns a Store rooted at dir, creating dir if needed.
 func New(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("creating cache root %q: %w", dir, err)
 	}
-	return &Store{root: dir}, nil
+	return &Store{root: dir, EvictGrace: DefaultEvictGrace}, nil
 }
 
 type meta struct {
 	OutputID string
 	Time     time.Time
+
+	// Body is the body file's name within the shard directory. Empty in
+	// metas written before bodies were named per output; see bodyName.
+	Body string `json:",omitempty"`
 }
 
-func (s *Store) paths(actionID []byte) (bodyPath, metaPath string) {
-	hexID := hex.EncodeToString(actionID)
+const (
+	bodySuffix = ".body"
+	metaSuffix = ".meta"
+	tmpPrefix  = ".tmp-"
+)
+
+func (s *Store) shardDir(hexID string) string {
 	shard := "00"
 	if len(hexID) >= 2 {
 		shard = hexID[:2]
 	}
-	dir := filepath.Join(s.root, shard)
-	return filepath.Join(dir, hexID+".body"), filepath.Join(dir, hexID+".meta")
+	return filepath.Join(s.root, shard)
+}
+
+func (s *Store) metaPath(actionID []byte) string {
+	hexID := hex.EncodeToString(actionID)
+	return filepath.Join(s.shardDir(hexID), hexID+metaSuffix)
+}
+
+func (s *Store) bodyPath(actionID, outputID []byte) string {
+	hexID := hex.EncodeToString(actionID)
+	return filepath.Join(s.shardDir(hexID), hexID+"-"+hex.EncodeToString(outputID)+bodySuffix)
+}
+
+// legacyBodyPath is where bodies lived before they were named per output.
+func (s *Store) legacyBodyPath(actionID []byte) string {
+	hexID := hex.EncodeToString(actionID)
+	return filepath.Join(s.shardDir(hexID), hexID+bodySuffix)
+}
+
+// bodyName returns the file name (within its shard) of the body that m,
+// stored as the meta for the action with hex ID hexID, describes.
+func (m meta) bodyName(hexID string) string {
+	if m.Body != "" {
+		return m.Body
+	}
+	return hexID + bodySuffix
 }
 
 // Get implements cas.Store.
 func (s *Store) Get(actionID []byte) (cas.Entry, bool, error) {
-	bodyPath, metaPath := s.paths(actionID)
+	metaPath := s.metaPath(actionID)
 
 	mb, err := os.ReadFile(metaPath)
 	if os.IsNotExist(err) {
@@ -71,6 +128,10 @@ func (s *Store) Get(actionID []byte) (cas.Entry, bool, error) {
 	if err := json.Unmarshal(mb, &m); err != nil {
 		return cas.Entry{}, false, fmt.Errorf("decoding meta for action %x: %w", actionID, err)
 	}
+	if m.Body != "" && (filepath.Base(m.Body) != m.Body || !strings.HasSuffix(m.Body, bodySuffix)) {
+		return cas.Entry{}, false, fmt.Errorf("meta for action %x names an invalid body file %q", actionID, m.Body)
+	}
+	bodyPath := filepath.Join(filepath.Dir(metaPath), m.bodyName(hex.EncodeToString(actionID)))
 
 	fi, err := os.Stat(bodyPath)
 	if os.IsNotExist(err) {
@@ -114,7 +175,7 @@ func (s *Store) Put(actionID, outputID []byte, body io.Reader, size int64) (stri
 		// takes down the whole daemon, not just the one bad request.
 		body = bytes.NewReader(nil)
 	}
-	bodyPath, metaPath := s.paths(actionID)
+	bodyPath, metaPath := s.bodyPath(actionID, outputID), s.metaPath(actionID)
 	if err := os.MkdirAll(filepath.Dir(bodyPath), 0o755); err != nil {
 		return "", fmt.Errorf("creating shard dir: %w", err)
 	}
@@ -126,6 +187,7 @@ func (s *Store) Put(actionID, outputID []byte, body io.Reader, size int64) (stri
 	m := meta{
 		OutputID: hex.EncodeToString(outputID),
 		Time:     time.Now().UTC(),
+		Body:     filepath.Base(bodyPath),
 	}
 	mb, err := json.Marshal(m)
 	if err != nil {
@@ -156,100 +218,159 @@ func (s *Store) Close() error { return nil }
 // opt-in "-gc" flag instead, for exactly this reason: running a full walk
 // on every subprocess would slow down every build.
 //
-// A meta file without a matching body (or vice versa) is treated as
-// orphaned and removed unconditionally, regardless of maxBytes — that
-// state should only arise from a process being killed mid-Put, and
-// leaving it around serves no purpose.
+// Regardless of maxBytes, it also removes debris: bodies no meta refers to
+// (left by a process killed mid-Put, or superseded by a later Put of the
+// same action with a different output), metas whose body is gone or that
+// can't be parsed, and temp files abandoned by writeAtomic. Nothing
+// modified within EvictGrace is touched, whether debris or not -- see
+// EvictGrace for why.
 func (s *Store) Evict(maxBytes int64) (freedBytes int64, err error) {
-	type item struct {
-		bodyPath, metaPath string
-		mtime              time.Time
-		size               int64
+	type body struct {
+		path  string
+		mtime time.Time
+		size  int64
+		// metaPath is the meta that refers to this body, if any.
+		metaPath string
 	}
 
 	var (
-		items []item
-		total int64
+		bodies = map[string]*body{} // keyed by path
+		metas  []string
+		cutoff = time.Now().Add(-s.EvictGrace)
 	)
+
+	removeIfStale := func(path string, info os.FileInfo) bool {
+		if info.ModTime().After(cutoff) {
+			return false
+		}
+		return os.Remove(path) == nil
+	}
 
 	walkErr := filepath.WalkDir(s.root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
+			if os.IsNotExist(err) {
+				return nil // removed concurrently mid-walk
+			}
 			return err
 		}
 		if d.IsDir() {
 			return nil
 		}
-
+		name := d.Name()
 		switch {
-		case strings.HasSuffix(path, ".meta"):
-			bodyPath := strings.TrimSuffix(path, ".meta") + ".body"
-			if _, err := os.Stat(bodyPath); os.IsNotExist(err) {
-				// Orphaned meta with no body: harmless (Get treats it as
-				// a miss) but pointless to keep, and we're walking the
-				// tree anyway.
-				os.Remove(path)
+		case strings.HasPrefix(name, tmpPrefix):
+			if info, err := d.Info(); err == nil && removeIfStale(path, info) {
+				freedBytes += info.Size()
 			}
-			return nil
-
-		case strings.HasSuffix(path, ".body"):
+		case strings.HasSuffix(name, metaSuffix):
+			metas = append(metas, path)
+		case strings.HasSuffix(name, bodySuffix):
 			info, err := d.Info()
+			if os.IsNotExist(err) {
+				return nil
+			}
 			if err != nil {
 				return fmt.Errorf("stat %s: %w", path, err)
 			}
-			metaPath := strings.TrimSuffix(path, ".body") + ".meta"
-			if _, err := os.Stat(metaPath); os.IsNotExist(err) {
-				// Orphaned body with no meta: remove unconditionally,
-				// regardless of maxBytes.
-				if rmErr := os.Remove(path); rmErr == nil {
-					freedBytes += info.Size()
-				}
-				return nil
-			}
-			items = append(items, item{
-				bodyPath: path,
-				metaPath: metaPath,
-				mtime:    info.ModTime(),
-				size:     info.Size(),
-			})
-			total += info.Size()
-			return nil
-
-		default:
-			return nil
+			bodies[path] = &body{path: path, mtime: info.ModTime(), size: info.Size()}
 		}
+		return nil
 	})
 	if walkErr != nil {
 		return freedBytes, fmt.Errorf("walking store at %s: %w", s.root, walkErr)
+	}
+
+	// Pair each meta with the body it names.
+	for _, metaPath := range metas {
+		info, err := os.Stat(metaPath)
+		if err != nil {
+			continue
+		}
+		var m meta
+		mb, err := os.ReadFile(metaPath)
+		if err == nil {
+			err = json.Unmarshal(mb, &m)
+		}
+		if err != nil {
+			removeIfStale(metaPath, info) // unparseable: Get would only ever error on it
+			continue
+		}
+		hexID := strings.TrimSuffix(filepath.Base(metaPath), metaSuffix)
+		b, ok := bodies[filepath.Join(filepath.Dir(metaPath), m.bodyName(hexID))]
+		if !ok {
+			removeIfStale(metaPath, info) // its body is gone: Get already treats it as a miss
+			continue
+		}
+		b.metaPath = metaPath
+	}
+
+	var (
+		live  []*body
+		total int64
+	)
+	for _, b := range bodies {
+		if b.metaPath == "" {
+			if !b.mtime.After(cutoff) && os.Remove(b.path) == nil {
+				freedBytes += b.size
+			}
+			continue
+		}
+		live = append(live, b)
+		total += b.size
 	}
 
 	if total <= maxBytes {
 		return freedBytes, nil
 	}
 
-	sort.Slice(items, func(i, j int) bool { return items[i].mtime.Before(items[j].mtime) })
+	sort.Slice(live, func(i, j int) bool { return live[i].mtime.Before(live[j].mtime) })
 
-	for _, it := range items {
+	for _, b := range live {
 		if total <= maxBytes {
 			break
 		}
-		if err := os.Remove(it.bodyPath); err != nil && !os.IsNotExist(err) {
+		if b.mtime.After(cutoff) {
+			// Everything from here on was used within the grace period;
+			// leave the store over its cap rather than evict an object
+			// some build may be about to read.
+			break
+		}
+		if err := os.Remove(b.path); err != nil && !os.IsNotExist(err) {
 			// Leave it for the next sweep rather than failing the whole
 			// pass over one uncooperative file.
 			continue
 		}
-		os.Remove(it.metaPath) // best-effort; a dangling meta is harmless, Get treats it as a miss
-		total -= it.size
-		freedBytes += it.size
+		s.removeMetaIfFor(b.metaPath, filepath.Base(b.path))
+		total -= b.size
+		freedBytes += b.size
 	}
 
 	return freedBytes, nil
+}
+
+// removeMetaIfFor removes the meta at metaPath if it still refers to the
+// body named bodyName. A concurrent Put may have just replaced it with a
+// meta for a new body, which must be left alone. (Best-effort either way:
+// a dangling meta is harmless, Get treats it as a miss.)
+func (s *Store) removeMetaIfFor(metaPath, bodyName string) {
+	mb, err := os.ReadFile(metaPath)
+	if err != nil {
+		return
+	}
+	var m meta
+	if json.Unmarshal(mb, &m) != nil {
+		return
+	}
+	if m.bodyName(strings.TrimSuffix(filepath.Base(metaPath), metaSuffix)) == bodyName {
+		os.Remove(metaPath)
+	}
 }
 
 // writeAtomic writes r to a temp file beside path, then renames it into
 // place, so a concurrent Get never observes a partially written entry.
 func writeAtomic(path string, r io.Reader) error {
 	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	tmp, err := os.CreateTemp(dir, tmpPrefix+"*")
 	if err != nil {
 		return err
 	}
